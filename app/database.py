@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     name         TEXT NOT NULL,
     node_type    TEXT NOT NULL DEFAULT 'service',
     estimated_seconds INTEGER NOT NULL DEFAULT 0, -- 预估工期（秒），旧批次 / 未填按 0
+    max_attempts INTEGER NOT NULL DEFAULT 1,      -- 最大尝试次数（含首次），旧批次兼容为 1
+    retry_delay_seconds INTEGER NOT NULL DEFAULT 0, -- 自动重试延迟（秒）
+    attempt_count INTEGER NOT NULL DEFAULT 0,     -- 已失败回报次数（原子递增）
+    retry_scheduled INTEGER NOT NULL DEFAULT 0,   -- 1=已安排自动重试，等待 next_retry_at 到期
+    next_retry_at TEXT,                           -- 重试到期时间（ISO8601），到期前不进入 next_nodes
     level        INTEGER NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back
@@ -64,7 +69,7 @@ CREATE TABLE IF NOT EXISTS node_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     release_id   TEXT NOT NULL,
     node_name    TEXT NOT NULL,
-    event_type   TEXT NOT NULL, -- report_success | report_failure | rollback | retry_reset
+    event_type   TEXT NOT NULL, -- report_success | report_failure | rollback | retry_reset | retry_scheduled
     version      TEXT,
     detail_json  TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL
@@ -82,6 +87,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE nodes ADD COLUMN estimated_seconds INTEGER NOT NULL DEFAULT 0"
         )
+    if "max_attempts" not in cols:
+        # 旧批次按 max_attempts=1 兼容：失败即终态回滚，行为与升级前一致
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 1"
+        )
+    if "retry_delay_seconds" not in cols:
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN retry_delay_seconds INTEGER NOT NULL DEFAULT 0"
+        )
+    if "attempt_count" not in cols:
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "retry_scheduled" not in cols:
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN retry_scheduled INTEGER NOT NULL DEFAULT 0"
+        )
+    if "next_retry_at" not in cols:
+        conn.execute("ALTER TABLE nodes ADD COLUMN next_retry_at TEXT")
 
 
 def init_db(db_path: str | None = None) -> None:

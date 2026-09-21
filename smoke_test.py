@@ -355,4 +355,152 @@ with TestClient(app) as legacy_client:
     assert zero_deadline["feasible"] is True and zero_deadline["gap_seconds"] == 0
 print("[OK] 旧库自动迁移 estimated_seconds 列，旧批次工期按 0，CPM 分析完整")
 
+# --- 16. 有限自动重试：max_attempts / retry_delay_seconds 校验与持久化 ---
+# 第 15 步把全局连接切到了 legacy.db，先切回主测试库
+config.DB_PATH = os.environ["DB_PATH"]
+database.init_db(os.environ["DB_PATH"])
+conn = database.get_conn()
+
+assert client.post("/api/releases", json={
+    "version": "bad-ma", "nodes": [{"name": "a", "max_attempts": 0}]}).status_code == 422
+assert client.post("/api/releases", json={
+    "version": "bad-ma", "nodes": [{"name": "a", "max_attempts": 11}]}).status_code == 422
+assert client.post("/api/releases", json={
+    "version": "bad-rd", "nodes": [{"name": "a", "retry_delay_seconds": -1}]}).status_code == 422
+assert client.post("/api/releases", json={
+    "version": "bad-rd", "nodes": [{"name": "a", "retry_delay_seconds": 3601}]}).status_code == 422
+
+r = client.post("/api/releases", json={
+    "version": "v-retry",
+    "nodes": [
+        {"name": "a", "max_attempts": 3, "retry_delay_seconds": 3600},
+        {"name": "b"}],
+    "dependencies": [{"from_node": "a", "to_node": "b"}],
+})
+assert r.status_code == 201, r.text
+ridr = r.json()["id"]
+na = next(n for n in r.json()["nodes"] if n["name"] == "a")
+assert na["max_attempts"] == 3 and na["retry_delay_seconds"] == 3600
+assert na["attempt_count"] == 0 and na["retry_scheduled"] is False
+assert na["next_retry_at"] is None
+# 未传时默认 max_attempts=1 / retry_delay_seconds=0
+nb = next(n for n in r.json()["nodes"] if n["name"] == "b")
+assert nb["max_attempts"] == 1 and nb["retry_delay_seconds"] == 0
+print("[OK] max_attempts(1~10) / retry_delay_seconds(0~3600) 校验与默认值持久化")
+
+# --- 17. 首次失败（未达上限）：不回滚、恢复 pending、排除出 next_nodes、到期前 409 ---
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "failed", "version": "v-retry",
+                      "error_code": "BOOM", "error_message": "第一次失败"})
+assert r.status_code == 200, r.text
+sched = r.json()
+assert sched["result"] == "retry_scheduled"
+assert sched["rollback_scope"] == "none" and sched["rolled_back_nodes"] == []
+assert sched["attempt_count"] == 1 and sched["max_attempts"] == 3
+assert sched["next_retry_at"] is not None
+assert sched["release"]["status"] == "running"  # 未触发批次失败 / 回滚
+na = next(n for n in sched["release"]["nodes"] if n["name"] == "a")
+assert na["status"] == "pending"
+assert na["attempt_count"] == 1 and na["retry_scheduled"] is True
+assert na["next_retry_at"] == sched["next_retry_at"]
+assert na["error_code"] == "BOOM"  # 最近一次失败信息保留在等待中的节点上
+# 未到期：a 不进入 next_nodes（其前置为空，但仍被排除）
+assert sched["release"]["next_nodes"] == []
+
+# 到期前回报（无论成功失败）-> 409 retry_not_due，状态不变
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "success", "version": "v-retry"})
+assert r.status_code == 409 and r.json()["error"]["code"] == "retry_not_due"
+assert r.json()["error"]["next_retry_at"] == sched["next_retry_at"]
+assert r.json()["error"]["attempt_count"] == 1
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "failed", "version": "v-retry"})
+assert r.status_code == 409 and r.json()["error"]["code"] == "retry_not_due"
+# 409 不改变状态：attempt_count 仍为 1，批次仍 running，a 仍被排除
+st = client.get(f"/api/releases/{ridr}").json()
+na = next(n for n in st["nodes"] if n["name"] == "a")
+assert na["attempt_count"] == 1 and na["retry_scheduled"] is True
+assert st["status"] == "running" and st["next_nodes"] == []
+print("[OK] 首次失败 -> retry_scheduled（不回滚/pending/排除 next_nodes），到期前 409 retry_not_due 且状态不变")
+
+# --- 18. 到期后节点重新出现，继续失败到上限 -> 现有失败回滚语义 ---
+conn.execute("UPDATE nodes SET next_retry_at = ? WHERE release_id = ? AND name = 'a'",
+             ("2000-01-01T00:00:00+00:00", ridr))
+conn.commit()
+st = client.get(f"/api/releases/{ridr}").json()
+assert st["next_nodes"] == ["a"]  # 到期且无前置 -> 重新出现
+
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "failed", "version": "v-retry"})
+assert r.json()["result"] == "retry_scheduled"
+assert r.json()["attempt_count"] == 2  # 原子递增
+conn.execute("UPDATE nodes SET next_retry_at = ? WHERE release_id = ? AND name = 'a'",
+             ("2000-01-01T00:00:00+00:00", ridr))
+conn.commit()
+
+# 第三次失败：attempt_count(3) 达到 max_attempts(3) -> 终态回滚
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "failed", "version": "v-retry",
+                      "error_code": "FATAL"})
+assert r.status_code == 200, r.text
+fb = r.json()
+assert fb["result"] == "failed_and_rolled_back"
+assert fb["release"]["status"] == "failed"  # 此前无成功节点
+na = next(n for n in fb["release"]["nodes"] if n["name"] == "a")
+assert na["status"] == "failed" and na["attempt_count"] == 3
+assert na["retry_scheduled"] is False and na["next_retry_at"] is None
+assert na["error_code"] == "FATAL"
+# 终态后回报仍是 release_aborted（未被重试逻辑旁路）
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "success", "version": "v-retry"})
+assert r.status_code == 409 and r.json()["error"]["code"] == "release_aborted"
+print("[OK] 到期重新出现 -> 第 2 次仍调度；第 3 次达上限走失败终态与回滚 checkpoint 语义")
+
+# --- 19. 手动 /retry 续发后 attempt_count 清零，重新获得完整自动重试额度 ---
+r = client.post(f"/api/releases/{ridr}/retry")
+assert r.status_code == 200
+na = next(n for n in r.json()["release"]["nodes"] if n["name"] == "a")
+assert na["status"] == "pending" and na["attempt_count"] == 0
+assert na["retry_scheduled"] is False and na["next_retry_at"] is None
+r = client.post(f"/api/releases/{ridr}/report",
+                json={"node": "a", "status": "failed", "version": "v-retry"})
+assert r.json()["result"] == "retry_scheduled"
+assert r.json()["attempt_count"] == 1  # 重新从 1 计数
+print("[OK] /retry 续发重置 attempt_count/retry_scheduled/next_retry_at，重试额度刷新")
+
+# --- 20. retry_delay_seconds=0：失败立即可再次回报（next_retry_at 已到期）---
+r = client.post("/api/releases", json={
+    "version": "v-zero",
+    "nodes": [{"name": "z", "max_attempts": 2, "retry_delay_seconds": 0}],
+})
+ridz = r.json()["id"]
+r = client.post(f"/api/releases/{ridz}/report",
+                json={"node": "z", "status": "failed", "version": "v-zero"})
+assert r.json()["result"] == "retry_scheduled"
+assert r.json()["release"]["next_nodes"] == ["z"]  # 延迟 0：到期立即可见
+r = client.post(f"/api/releases/{ridz}/report",
+                json={"node": "z", "status": "success", "version": "v-zero"})
+assert r.status_code == 200 and r.json()["release"]["status"] == "succeeded"
+nz = next(n for n in r.json()["release"]["nodes"] if n["name"] == "z")
+assert nz["attempt_count"] == 1 and nz["retry_scheduled"] is False  # 成功后清除等待标记
+print("[OK] retry_delay_seconds=0：失败后立即重回 next_nodes；成功清除重试标记并完成批次")
+
+# --- 21. 旧批次兼容：迁移后的库 max_attempts 缺省为 1，首次失败即终态回滚 ---
+# 切回第 15 步建立的 legacy.db
+config.DB_PATH = old_db
+database.init_db(old_db)
+with TestClient(app) as legacy_client:
+    # leg1 在第 15 步建立：x(level0)->y(level1)，迁移后重试字段取默认值
+    lg = legacy_client.get("/api/releases/leg1").json()
+    lx = next(n for n in lg["nodes"] if n["name"] == "x")
+    assert lx["max_attempts"] == 1 and lx["attempt_count"] == 0
+    assert lx["retry_delay_seconds"] == 0 and lx["retry_scheduled"] is False
+    assert lx["next_retry_at"] is None
+    r = legacy_client.post("/api/releases/leg1/report",
+                           json={"node": "x", "status": "failed", "version": "ver"})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"] == "failed_and_rolled_back"
+    assert r.json()["release"]["status"] == "failed"
+print("[OK] 旧批次 max_attempts 默认 1：首次失败即终态回滚，详情返回全部重试字段")
+
 print("\n全部测试通过 ✔")

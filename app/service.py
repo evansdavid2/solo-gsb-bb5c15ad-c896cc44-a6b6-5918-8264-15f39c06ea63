@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .database import get_conn, lock, transaction
@@ -205,14 +205,17 @@ def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
         for node in payload.nodes:
             conn.execute(
                 """INSERT INTO nodes
-                   (release_id, name, node_type, estimated_seconds, level,
+                   (release_id, name, node_type, estimated_seconds,
+                    max_attempts, retry_delay_seconds, level,
                     metadata_json, status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     release_id,
                     node.name,
                     node.node_type,
                     node.estimated_seconds or 0,
+                    node.max_attempts,
+                    node.retry_delay_seconds,
                     level_of[node.name],
                     json.dumps(node.metadata, ensure_ascii=False),
                     PENDING,
@@ -313,6 +316,7 @@ def _build_view(conn, r) -> dict[str, Any]:
 
     nodes = []
     status_of: dict[str, str] = {}
+    now_dt = datetime.now(timezone.utc)
     for n in node_rows:
         status_of[n["name"]] = n["status"]
         nodes.append({
@@ -326,13 +330,29 @@ def _build_view(conn, r) -> dict[str, Any]:
             "error_message": n["error_message"],
             "reported_at": n["reported_at"],
             "updated_at": n["updated_at"],
+            "attempt_count": int(n["attempt_count"] or 0),
+            "max_attempts": int(n["max_attempts"] if n["max_attempts"] is not None else 1),
+            "retry_delay_seconds": int(n["retry_delay_seconds"] or 0),
+            "retry_scheduled": bool(n["retry_scheduled"]),
+            "next_retry_at": n["next_retry_at"],
             "metadata": json.loads(n["metadata_json"]),
         })
 
-    # 当前可执行（可回报）的 pending 节点：所有前置均已 success
+    # 当前可执行（可回报）的 pending 节点：所有前置均已 success；
+    # 自动重试等待中的节点（retry_scheduled=1 且 next_retry_at 未到期）须排除，
+    # 到期且前置仍为 success 时自动重新出现
+    def _due(n) -> bool:
+        if not n["retry_scheduled"] or not n["next_retry_at"]:
+            return True
+        try:
+            return datetime.fromisoformat(n["next_retry_at"]) <= now_dt
+        except ValueError:  # 防御：时间戳异常时不过度阻塞节点
+            return True
+
     next_nodes = sorted(
         n["name"] for n in node_rows
         if n["status"] == PENDING
+        and _due(n)
         and all(status_of.get(p) == SUCCESS for p in prereqs[n["name"]])
     )
     done = sum(1 for s in status_of.values() if s == SUCCESS)
@@ -416,6 +436,22 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
                 f"节点 {payload.node} 已在失败回滚中被回滚，请调用 /retry 续发",
             )
 
+        # 3.5) 自动重试等待期：节点已恢复 pending 但 next_retry_at 未到期，
+        #      此时回报一律 409 retry_not_due，且不改变任何状态
+        if node["retry_scheduled"] and node["next_retry_at"]:
+            try:
+                due_at = datetime.fromisoformat(node["next_retry_at"])
+            except ValueError:
+                due_at = None
+            if due_at is not None and due_at > datetime.now(timezone.utc):
+                raise APIError(
+                    409, "retry_not_due",
+                    f"节点 {payload.node} 的自动重试尚未到期，请在 {node['next_retry_at']} 之后再回报",
+                    {"node": payload.node, "next_retry_at": node["next_retry_at"],
+                     "attempt_count": int(node["attempt_count"] or 0),
+                     "max_attempts": int(node["max_attempts"] or 1)},
+                )
+
         # 4) 乱序回报校验：所有前置必须已成功（拓扑顺序不可跨越）
         prereq_rows = conn.execute(
             "SELECT from_node FROM edges WHERE release_id = ? AND to_node = ?",
@@ -444,7 +480,8 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
         if payload.status == SUCCESS:
             conn.execute(
                 """UPDATE nodes SET status = ?, reported_version = ?, error_code = NULL,
-                   error_message = NULL, reported_at = ?, updated_at = ?
+                   error_message = NULL, reported_at = ?, updated_at = ?,
+                   retry_scheduled = 0, next_retry_at = NULL
                    WHERE id = ?""",
                 (SUCCESS, payload.version, now, now, node["id"]),
             )
@@ -464,16 +501,74 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
             view = _build_view(conn, r)
             return {"result": "accepted", "release": view}
 
-        # ---- 失败回报：仅回滚本批次“已成功”的节点（失败节点本身保持 failed） ----
+        # ---- 失败回报：先原子递增 attempt_count（每次失败只 +1），再判断是否仍有自动重试额度 ----
+        max_attempts = int(node["max_attempts"] if node["max_attempts"] is not None else 1)
+        retry_delay = int(node["retry_delay_seconds"] or 0)
         conn.execute(
-            """UPDATE nodes SET status = ?, reported_version = ?, error_code = ?,
-               error_message = ?, reported_at = ?, updated_at = ? WHERE id = ?""",
-            (FAILED, payload.version, payload.error_code or "FAILED",
-             payload.error_message, now, now, node["id"]),
+            "UPDATE nodes SET attempt_count = attempt_count + 1, updated_at = ? WHERE id = ?",
+            (now, node["id"]),
         )
+        attempt_count = conn.execute(
+            "SELECT attempt_count FROM nodes WHERE id = ?", (node["id"],)
+        ).fetchone()["attempt_count"]
+
         _record_event(
             conn, release_id, payload.node, "report_failure", payload.version,
-            {"error_code": payload.error_code, "error_message": payload.error_message},
+            {"error_code": payload.error_code, "error_message": payload.error_message,
+             "attempt_count": attempt_count, "max_attempts": max_attempts},
+        )
+
+        # 未达上限：不触发批次回滚。节点恢复 pending、已成功前置保持 success，
+        # next_retry_at = 失败时间 + retry_delay_seconds，到期后自动重新可执行
+        if attempt_count < max_attempts:
+            next_retry_at = (
+                datetime.fromisoformat(now) + timedelta(seconds=retry_delay)
+            ).isoformat()
+            conn.execute(
+                """UPDATE nodes SET status = ?, reported_version = ?, error_code = ?,
+                   error_message = ?, reported_at = ?, updated_at = ?,
+                   retry_scheduled = 1, next_retry_at = ?
+                   WHERE id = ?""",
+                (PENDING, payload.version, payload.error_code or "FAILED",
+                 payload.error_message, now, now, next_retry_at, node["id"]),
+            )
+            _record_event(
+                conn, release_id, payload.node, "retry_scheduled", payload.version,
+                {"attempt_count": attempt_count, "max_attempts": max_attempts,
+                 "retry_delay_seconds": retry_delay, "next_retry_at": next_retry_at},
+            )
+            # 自动重试不改变批次终态：pending -> running，running 保持 running
+            conn.execute(
+                "UPDATE releases SET status = ?, updated_at = ? WHERE id = ?",
+                (R_RUNNING, now, release_id),
+            )
+            r["status"] = R_RUNNING
+            r["updated_at"] = now
+            view = _build_view(conn, r)
+            return {
+                "result": "retry_scheduled",
+                "failed_node": payload.node,
+                "rollback_scope": "none",
+                "rolled_back_nodes": [],
+                "attempt_count": attempt_count,
+                "max_attempts": max_attempts,
+                "next_retry_at": next_retry_at,
+                "retry_delay_seconds": retry_delay,
+                "checkpoint": {
+                    "next_nodes": view["next_nodes"],
+                    "instruction": "节点已恢复 pending 并安排自动重试；到期且前置成功后该节点会重新"
+                                   "出现在 next_nodes，到期前回报将返回 409 retry_not_due",
+                },
+                "release": view,
+            }
+
+        # ---- 达到上限：保持现有失败语义，仅回滚本批次“已成功”的节点（失败节点本身保持 failed） ----
+        conn.execute(
+            """UPDATE nodes SET status = ?, reported_version = ?, error_code = ?,
+               error_message = ?, reported_at = ?, updated_at = ?,
+               retry_scheduled = 0, next_retry_at = NULL WHERE id = ?""",
+            (FAILED, payload.version, payload.error_code or "FAILED",
+             payload.error_message, now, now, node["id"]),
         )
 
         # 逆拓扑顺序回滚：层级高的先回滚；同层按回报时间倒序（后成功的先回滚）
@@ -486,7 +581,9 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
         rolled_back: list[dict[str, Any]] = []
         for row in success_rows:
             conn.execute(
-                "UPDATE nodes SET status = ?, updated_at = ? WHERE release_id = ? AND name = ?",
+                """UPDATE nodes SET status = ?, updated_at = ?,
+                   retry_scheduled = 0, next_retry_at = NULL
+                   WHERE release_id = ? AND name = ?""",
                 (ROLLED_BACK, now, release_id, row["name"]),
             )
             _record_event(conn, release_id, row["name"], "rollback", payload.version,
@@ -521,6 +618,8 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
             "rollback_scope": "current_release_only",
             "rolled_back_nodes": rolled_back,
             "resumable": True,
+            "attempt_count": attempt_count,
+            "max_attempts": max_attempts,
             "checkpoint": {
                 "retry_endpoint": f"/api/releases/{release_id}/retry",
                 "method": "POST",
@@ -553,7 +652,8 @@ def retry_release(release_id: str) -> dict[str, Any]:
         now = _now()
         conn.execute(
             """UPDATE nodes SET status = ?, reported_version = NULL, error_code = NULL,
-               error_message = NULL, reported_at = NULL, updated_at = ?
+               error_message = NULL, reported_at = NULL, updated_at = ?,
+               attempt_count = 0, retry_scheduled = 0, next_retry_at = NULL
                WHERE release_id = ? AND status IN (?, ?)""",
             (PENDING, now, release_id, FAILED, ROLLED_BACK),
         )

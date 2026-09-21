@@ -3,8 +3,9 @@
 本地可运行的服务节点依赖图发布系统：客户端提交服务节点及依赖关系（节点可带正整数预估工期 `estimated_seconds`），
 创建带版本号的发布批次；
 系统按**拓扑层级**生成执行计划，并对依赖 DAG 做**关键路径（CPM）动态规划**给出最短工期、各节点最早/最晚开始时间与零余量关键节点；
-接收每个节点的成功/失败回报；节点失败时**仅回滚本批次已成功的节点**
-并返回**可重试的断点**；同时拒绝**循环依赖**和**跨版本 / 乱序回报**。
+接收每个节点的成功/失败回报；节点失败时若**自动重试额度未用尽**则原子递增尝试次数、将节点恢复为 `pending`
+并按可配置延迟安排重试（到期前节点不会出现在 `next_nodes`，提前回报返回 `409 retry_not_due`）；
+**达到尝试上限**后仅回滚本批次已成功的节点并返回**可重试的断点**；同时拒绝**循环依赖**和**跨版本 / 乱序回报**。
 
 ## 一条命令启动
 
@@ -77,6 +78,35 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 已回报过的节点不可重复回报（`409 already_reported`）。
 - 批次失败回滚后不可继续回报，需先调用 `/retry` 续发（`409 release_aborted`）。
 
+**有限自动重试**
+
+每个节点可在创建时配置：
+
+| 字段 | 默认 | 取值 | 说明 |
+| --- | --- | --- | --- |
+| `max_attempts` | `1` | `1 ～ 10` | 最大尝试次数（含首次回报）；`1` 表示不自动重试，首次失败即终态 |
+| `retry_delay_seconds` | `0` | `0 ～ 3600` | 失败后自动重试的延迟（秒）；`0` 表示到期立即可再次回报 |
+
+两个字段均持久化；旧批次（升级前创建）自动迁移并按 `max_attempts=1`、`retry_delay_seconds=0` 兼容，行为与升级前一致。
+
+- 节点回报 `failed` 时，在同一事务内**原子递增** `attempt_count`：
+  - **尚未达到上限**（`attempt_count < max_attempts`）：**不触发批次回滚**，批次保持 / 进入 `running`；
+    失败节点恢复为 `pending`，已成功的前置节点保持 `success`；
+    设置 `next_retry_at = 失败时间 + retry_delay_seconds`，并标记 `retry_scheduled=true`；
+    响应 `result=retry_scheduled`，并记录 `retry_scheduled` 事件。
+  - 等待期内（`next_retry_at` 未到期）该节点被排除在 `GET /api/releases/{id}` 的 `next_nodes` 之外；
+    到期且所有前置仍为 `success` 时自动重新出现。
+  - 到期前对该节点的任何回报都返回 `409 retry_not_due`（携带 `next_retry_at` / `attempt_count` / `max_attempts`），
+    **不改变任何状态**（不递增计数、不改变批次 / 节点状态）。
+  - **达到上限**：保持既有失败语义——逆拓扑回滚本批次已成功节点、批次进入 `failed` /
+    `partially_rolled_back`、返回可重试 `checkpoint`；清除 `retry_scheduled` 与 `next_retry_at`。
+- 等待期后回报 `success`：节点成功，清除 `retry_scheduled` / `next_retry_at`；
+  `attempt_count` 保留为历史失败次数。
+- `POST /retry` 从终态续发时，重置节点的 `attempt_count=0`、`retry_scheduled=false`、
+  `next_retry_at=null`，自动重试额度重新按 `max_attempts` 计满。
+- 节点详情返回 `attempt_count`、`max_attempts`、`retry_delay_seconds`、`retry_scheduled`、
+  `next_retry_at`（UTC ISO-8601）。
+
 **失败回滚与断点重试**
 
 - 任一节点回报 `failed`：批次标记为 `partially_rolled_back`（此前无成功节点时为 `failed`）。
@@ -87,18 +117,20 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `POST /retry` 把所有 `failed` / `rolled_back` 节点重置为 `pending`，从最低待执行层级继续，
   已经成功过的节点（如发生在“部分成功后才失败”的重试场景）保留成功状态，不重复执行。
 
-节点状态：`pending` → `success` / `failed`；成功节点失败回滚后变为 `rolled_back`，重试重置回 `pending`。
+节点状态：`pending` → `success` / `failed`；失败未达重试上限时节点保持 `pending`
+（`retry_scheduled=true`、等待 `next_retry_at` 到期）；成功节点失败回滚后变为 `rolled_back`，
+终态重试重置回 `pending`。
 批次状态：`pending` / `running` / `succeeded` / `failed` / `partially_rolled_back`。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖，节点可填正整数 `estimated_seconds`，自动拓扑分层，拒绝环） |
+| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖；节点可填正整数 `estimated_seconds`、`max_attempts`(1~10)、`retry_delay_seconds`(0~3600)，自动拓扑分层，拒绝环） |
 | `GET` | `/api/releases?limit=50` | 发布批次列表 |
-| `GET` | `/api/releases/{id}` | 查询发布状态（节点状态、进度、next_nodes） |
+| `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现） |
 | `GET` | `/api/releases/{id}/plan?deadline_seconds=` | 拓扑分层 + CPM 工期分析（最短工期、最早/最晚开始、total_slack、零余量关键节点、字典序最小关键路径；可选截止工期可行性，只读） |
-| `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409） |
+| `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409；自动重试等待期返回 409 retry_not_due；未达上限返回 retry_scheduled，达上限失败回滚） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发 |
 | `GET` | `/health` | 健康检查 |
 
@@ -185,6 +217,33 @@ curl -s -X POST http://localhost:8000/api/releases/<ID>/retry
 curl -s http://localhost:8000/api/releases/<ID>
 ```
 
+有限自动重试示例（最多 3 次尝试、每次间隔 60 秒）：
+
+```bash
+# 1) 创建带重试策略的批次
+curl -s -X POST http://localhost:8000/api/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "2026.09.21-003",
+    "nodes": [{"name": "svc-a", "max_attempts": 3, "retry_delay_seconds": 60}]
+  }'
+
+# 2) 首次失败：不回滚，节点恢复 pending、attempt_count=1、安排 next_retry_at
+curl -s -X POST http://localhost:8000/api/releases/<ID>/report \
+  -H 'Content-Type: application/json' \
+  -d '{"node":"svc-a","status":"failed","version":"2026.09.21-003","error_code":"BOOT_FAIL"}'
+# -> {"result":"retry_scheduled","attempt_count":1,"max_attempts":3,
+#     "next_retry_at":"...+00:00","release":{"status":"running",
+#     "next_nodes":[] /* 未到期，svc-a 不出现 */}}
+
+# 3) 到期前再次回报 -> 409，状态不变
+#    {"error":{"code":"retry_not_due","next_retry_at":"...","attempt_count":1,"max_attempts":3}}
+
+# 4) 到期（next_retry_at 之后）：svc-a 重新出现在 next_nodes，可再次回报；
+#    第 3 次失败（attempt_count=3 == max_attempts）才触发失败回滚与 checkpoint。
+#    POST /retry 从终态续发后 attempt_count 清零，重试额度重新计满。
+```
+
 循环依赖示例（返回 `422`）：
 
 ```bash
@@ -222,4 +281,7 @@ python3 smoke_test.py
 覆盖：循环依赖拒绝、拓扑分层、跨版本回报拒绝、乱序回报拒绝、重复回报拒绝、
 失败逆序回滚本批次已成功节点、断点重试后走完全程、部分回滚、历史批次隔离、重复初始化幂等、
 CPM 前向/后向分析与零余量关键节点、并列最长路径字典序最小、deadline 可行性与缺口秒数、
-查询不改变批次状态、estimated_seconds 正整数校验、旧版 SQLite 文件自动迁移且旧工期按 0。
+查询不改变批次状态、estimated_seconds 正整数校验、旧版 SQLite 文件自动迁移且旧工期按 0、
+max_attempts / retry_delay_seconds 取值校验与持久化、失败未达上限原子递增并调度重试（不回滚）、
+等待期排除 next_nodes 且提前回报 409 retry_not_due 状态不变、到期后重新出现、达到上限走终态回滚、
+retry_delay_seconds=0 立即重试、手动 /retry 清零计数刷新额度、旧批次 max_attempts 默认 1 兼容。

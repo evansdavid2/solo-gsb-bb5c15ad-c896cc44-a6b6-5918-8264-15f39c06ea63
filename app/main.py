@@ -82,7 +82,11 @@ def report_node(release_id: str, payload: ReportRequest) -> dict:
 
     - 跨版本回报 → 409 version_mismatch
     - 前置节点未全部成功就回报 → 409 out_of_order
-    - status=failed → 逆拓扑回滚本批次已成功节点，返回可重试断点
+    - 节点处于自动重试等待期（next_retry_at 未到期）→ 409 retry_not_due，状态不变
+    - status=failed 且 attempt_count < max_attempts → 原子递增尝试次数，节点恢复 pending
+      并安排 next_retry_at，不触发批次回滚（result=retry_scheduled）
+    - status=failed 且达到 max_attempts 上限 → 逆拓扑回滚本批次已成功节点，返回可重试断点
+      （旧批次 max_attempts 缺省为 1，首次失败即回滚）
     """
     return service.report_node(release_id, payload)
 
