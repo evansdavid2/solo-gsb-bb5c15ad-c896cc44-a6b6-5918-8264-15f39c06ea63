@@ -1,0 +1,24 @@
+services:
+  release-api:
+    build: .
+    image: dependency-release-api:latest
+    container_name: dependency-release-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 配置项（可用 .env / -e 覆盖）
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      DB_PATH: "/data/releases.db"
+    volumes:
+      # SQLite 文件持久化到命名卷，容器重建数据不丢
+      - release-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  release-data:
