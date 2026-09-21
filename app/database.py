@@ -38,9 +38,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     name         TEXT NOT NULL,
     node_type    TEXT NOT NULL DEFAULT 'service',
     estimated_seconds INTEGER NOT NULL DEFAULT 0, -- 预估工期（秒），旧批次 / 未填按 0
+    max_attempts INTEGER NOT NULL DEFAULT 1,      -- 最大尝试次数（含首次，1～10）；旧批次按 1
+    retry_delay_seconds INTEGER NOT NULL DEFAULT 0, -- 自动重试退避延迟（秒，0～3600）
+    attempt_count INTEGER NOT NULL DEFAULT 0,     -- 已失败次数（原子递增）
+    next_retry_at TEXT,                           -- 下次可重试时刻（ISO8601）；NULL 表示未安排
+    retry_scheduled INTEGER NOT NULL DEFAULT 0,   -- 是否处于等待重试的 pending：0|1
     level        INTEGER NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back
+    status       TEXT NOT NULL DEFAULT 'pending', -- pending(可含等待重试) | success | failed | rolled_back
     reported_version TEXT,
     error_code   TEXT,
     error_message TEXT,
@@ -64,7 +69,7 @@ CREATE TABLE IF NOT EXISTS node_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     release_id   TEXT NOT NULL,
     node_name    TEXT NOT NULL,
-    event_type   TEXT NOT NULL, -- report_success | report_failure | rollback | retry_reset
+    event_type   TEXT NOT NULL, -- report_success | report_failure | rollback | retry_reset | retry_scheduled | retry_exhausted
     version      TEXT,
     detail_json  TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL
@@ -82,6 +87,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE nodes ADD COLUMN estimated_seconds INTEGER NOT NULL DEFAULT 0"
         )
+    # 自动重试相关列：旧批次按 max_attempts=1（不自动重试）兼容既有失败即回滚语义
+    retry_columns = {
+        "max_attempts": "INTEGER NOT NULL DEFAULT 1",
+        "retry_delay_seconds": "INTEGER NOT NULL DEFAULT 0",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "next_retry_at": "TEXT",
+        "retry_scheduled": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, ddl in retry_columns.items():
+        if column not in cols:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {column} {ddl}")
 
 
 def init_db(db_path: str | None = None) -> None:

@@ -12,6 +12,14 @@ class NodeInput(BaseModel):
     estimated_seconds: int | None = Field(
         None, ge=1, description="预估工期（正整数，秒）；不传视为 0，用于关键路径分析"
     )
+    max_attempts: int = Field(
+        1, ge=1, le=10,
+        description="最大尝试次数（含首次执行，1～10，默认 1 即不自动重试）",
+    )
+    retry_delay_seconds: int = Field(
+        0, ge=0, le=3600,
+        description="失败后自动重试的退避延迟（0～3600 秒，默认 0 即到期立即可重试）",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict, description="附加元数据")
 
 

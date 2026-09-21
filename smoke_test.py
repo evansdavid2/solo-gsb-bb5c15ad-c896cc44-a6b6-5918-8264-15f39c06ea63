@@ -66,6 +66,10 @@ with TestClient(app) as client:
     assert body["status"] == "pending"
     assert body["levels"] == [["a", "b"], ["c"], ["d"]], body["levels"]
     assert body["next_nodes"] == ["a", "b"]
+    # 重试参数默认值：max_attempts=1 / retry_delay_seconds=0 / attempt_count=0
+    n0 = body["nodes"][0]
+    assert (n0["max_attempts"], n0["retry_delay_seconds"]) == (1, 0)
+    assert (n0["attempt_count"], n0["retry_scheduled"], n0["next_retry_at"]) == (0, False, None)
     print("[OK] 创建批次", rid, "分层:", body["levels"])
 
     # 计划接口
@@ -292,9 +296,179 @@ with TestClient(app) as client:
     assert sorted(rt["reset_nodes"]) == ["a", "c"]
     print("[OK] 部分回滚 -> 仅回滚 [a]；重试断点 next=[a,b]，重置=[a,c]")
 
+    # --- 12b. 自动重试参数校验（1～10 / 0～3600）---
+    for bad_node in (
+        {"name": "a", "max_attempts": 0},
+        {"name": "a", "max_attempts": 11},
+        {"name": "a", "retry_delay_seconds": -1},
+        {"name": "a", "retry_delay_seconds": 3601},
+    ):
+        rr = client.post("/api/releases", json={"version": "bad-retry", "nodes": [bad_node]})
+        assert rr.status_code == 422, bad_node
+    print("[OK] 重试参数校验：max_attempts 1～10、retry_delay_seconds 0～3600")
+
+    # --- 12c. 有限自动重试：失败等待 -> 409/排除 -> 到期重出现 -> 成功清除标记 ---
+    import time as _time  # noqa: E402
+
+    r = client.post("/api/releases", json={
+        "version": "v-retry",
+        "nodes": [{"name": "r", "max_attempts": 2, "retry_delay_seconds": 1}],
+    })
+    assert r.status_code == 201, r.text
+    rid_r = r.json()["id"]
+
+    # 第 1 次失败：不回滚，恢复 pending，安排 1 秒后重试
+    r = client.post(f"/api/releases/{rid_r}/report",
+                    json={"node": "r", "status": "failed", "version": "v-retry",
+                          "error_code": "BOOM"})
+    assert r.status_code == 200, r.text
+    sch = r.json()
+    assert sch["result"] == "retry_scheduled"
+    assert sch["rollback_triggered"] is False
+    assert (sch["attempt_count"], sch["max_attempts"], sch["attempts_remaining"]) == (1, 2, 1)
+    assert sch["retry_delay_seconds"] == 1 and sch["retry_scheduled"] is True
+    assert sch["next_retry_at"] is not None
+    rel = sch["release"]
+    assert rel["status"] == "pending" and rel["next_nodes"] == []
+    rn = next(n for n in rel["nodes"] if n["name"] == "r")
+    assert rn["status"] == "pending" and rn["retry_scheduled"] is True
+    assert rn["attempt_count"] == 1 and rn["max_attempts"] == 2
+    assert rn["next_retry_at"] == sch["next_retry_at"]
+    assert rn["error_code"] == "BOOM"  # 最近一次失败信息保留
+    print("[OK] 首次失败 -> retry_scheduled（attempt 1/2），批次不回滚")
+
+    # 等待期：GET 排除未到期节点；提前回报（成功/失败）均 409 retry_not_due 且状态不变
+    assert client.get(f"/api/releases/{rid_r}").json()["next_nodes"] == []
+    r = client.post(f"/api/releases/{rid_r}/report",
+                    json={"node": "r", "status": "success", "version": "v-retry"})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "retry_not_due", r.text
+    err = r.json()["error"]
+    assert err["node"] == "r" and err["attempt_count"] == 1
+    assert err["max_attempts"] == 2 and err["next_retry_at"] == sch["next_retry_at"]
+    r = client.post(f"/api/releases/{rid_r}/report",
+                    json={"node": "r", "status": "failed", "version": "v-retry"})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "retry_not_due"
+    still = client.get(f"/api/releases/{rid_r}").json()
+    sr = next(n for n in still["nodes"] if n["name"] == "r")
+    assert sr["attempt_count"] == 1 and sr["retry_scheduled"] is True
+    print("[OK] 未到期 -> next_nodes 排除且提前回报 409 retry_not_due（状态不变）")
+
+    # 到期：节点重新出现；前置（无前置）天然满足
+    _time.sleep(1.1)
+    due = client.get(f"/api/releases/{rid_r}").json()
+    assert due["next_nodes"] == ["r"]
+    # GET 是只读接口：到期不清标记
+    dr = next(n for n in due["nodes"] if n["name"] == "r")
+    assert dr["retry_scheduled"] is True and dr["attempt_count"] == 1
+
+    # 到期后成功：清除重试标记与 next_retry_at，批次完成；attempt_count 保留为历史值
+    r = client.post(f"/api/releases/{rid_r}/report",
+                    json={"node": "r", "status": "success", "version": "v-retry"})
+    assert r.status_code == 200, r.text
+    done = r.json()["release"]
+    assert done["status"] == "succeeded"
+    fr = next(n for n in done["nodes"] if n["name"] == "r")
+    assert fr["status"] == "success" and fr["retry_scheduled"] is False
+    assert fr["next_retry_at"] is None and fr["attempt_count"] == 1
+    print("[OK] 到期重新出现，重试成功 -> 清除重试标记（attempt_count 保留 1）")
+
+    # --- 12d. 达到上限 -> 保持失败回滚 / checkpoint 语义；/retry 清零计数与标记 ---
+    r = client.post("/api/releases", json={
+        "version": "v-retry-ex",
+        "nodes": [{"name": "e", "max_attempts": 2, "retry_delay_seconds": 0}],
+    })
+    rid_e = r.json()["id"]
+    r = client.post(f"/api/releases/{rid_e}/report",
+                    json={"node": "e", "status": "failed", "version": "v-retry-ex"})
+    s1 = r.json()
+    # 延迟 0：立即到期，next_nodes 当批次视图中即可见
+    assert s1["result"] == "retry_scheduled" and s1["attempts_remaining"] == 1
+    assert s1["release"]["next_nodes"] == ["e"]
+    assert s1["next_retry_at"] is not None
+
+    # 第 2 次失败（达到上限）：failed + 回滚语义 + checkpoint
+    r = client.post(f"/api/releases/{rid_e}/report",
+                    json={"node": "e", "status": "failed", "version": "v-retry-ex"})
+    assert r.status_code == 200, r.text
+    ex = r.json()
+    assert ex["result"] == "failed_and_rolled_back"
+    assert ex["failed_node"] == "e" and ex["rolled_back_nodes"] == []
+    en = ex["release"]["nodes"][0]
+    assert en["status"] == "failed" and en["attempt_count"] == 2
+    assert en["retry_scheduled"] is False and en["next_retry_at"] is None
+    assert ex["release"]["status"] == "failed"
+    print("[OK] attempt 达到 max_attempts=2 -> 失败回滚 + checkpoint（延迟 0 立即到期）")
+
+    # 断点 /retry：计数清零、标记清除，节点重新可执行
+    rt = client.post(f"/api/releases/{rid_e}/retry").json()
+    assert rt["checkpoint"]["next_nodes"] == ["e"]
+    ren = rt["release"]["nodes"][0]
+    assert ren["status"] == "pending" and ren["attempt_count"] == 0
+    assert ren["retry_scheduled"] is False and ren["next_retry_at"] is None
+    assert client.post(f"/api/releases/{rid_e}/report",
+                       json={"node": "e", "status": "success",
+                             "version": "v-retry-ex"}).json()["release"]["status"] == "succeeded"
+    print("[OK] /retry 断点续发清零 attempt_count / 重试标记")
+
+    # --- 12e. 重试等待节点阻塞后继；到期且前置成功后继方可出现 ---
+    r = client.post("/api/releases", json={
+        "version": "v-retry-dep",
+        "nodes": [
+            {"name": "p", "max_attempts": 1},
+            {"name": "q", "max_attempts": 3, "retry_delay_seconds": 1},
+        ],
+        "dependencies": [{"from_node": "p", "to_node": "q"}],
+    })
+    rid_q = r.json()["id"]
+    assert client.post(f"/api/releases/{rid_q}/report",
+                       json={"node": "p", "status": "success",
+                             "version": "v-retry-dep"}).status_code == 200
+    assert client.post(f"/api/releases/{rid_q}/report",
+                       json={"node": "q", "status": "failed",
+                             "version": "v-retry-dep"}).json()["result"] == "retry_scheduled"
+    assert client.get(f"/api/releases/{rid_q}").json()["next_nodes"] == []
+    _time.sleep(1.1)
+    assert client.get(f"/api/releases/{rid_q}").json()["next_nodes"] == ["q"]
+    assert client.post(f"/api/releases/{rid_q}/report",
+                       json={"node": "q", "status": "success",
+                             "version": "v-retry-dep"}).json()["release"]["status"] == "succeeded"
+    print("[OK] 等待重试节点阻塞后继；到期且前置成功后重新出现")
+
+    # --- 12f. 回滚后 /retry：等待重试中的 pending 节点一并解除调度 ---
+    r = client.post("/api/releases", json={
+        "version": "v-retry-mix",
+        "nodes": [
+            {"name": "wa", "max_attempts": 3, "retry_delay_seconds": 3600},
+            {"name": "wb", "max_attempts": 1},
+        ],
+    })
+    rid_m = r.json()["id"]
+    # wa 首次失败 -> 长时间等待；wb 达到上限失败 -> 触发批次回滚（wa 仍 pending 等待）
+    assert client.post(f"/api/releases/{rid_m}/report",
+                       json={"node": "wa", "status": "failed",
+                             "version": "v-retry-mix"}).json()["result"] == "retry_scheduled"
+    fb = client.post(f"/api/releases/{rid_m}/report",
+                     json={"node": "wb", "status": "failed",
+                           "version": "v-retry-mix"}).json()
+    assert fb["result"] == "failed_and_rolled_back"
+    assert fb["release"]["status"] == "failed"
+    wa_after = next(n for n in fb["release"]["nodes"] if n["name"] == "wa")
+    assert wa_after["status"] == "pending" and wa_after["retry_scheduled"] is True
+    assert fb["release"]["next_nodes"] == []  # wa 未到期、wb failed
+    rt = client.post(f"/api/releases/{rid_m}/retry").json()
+    assert sorted(rt["reset_nodes"]) == ["wb"]
+    assert rt["cleared_waiting_nodes"] == ["wa"]
+    assert rt["checkpoint"]["next_nodes"] == ["wa", "wb"]
+    wa_rt = next(n for n in rt["release"]["nodes"] if n["name"] == "wa")
+    assert wa_rt["retry_scheduled"] is False and wa_rt["next_retry_at"] is None
+    assert wa_rt["attempt_count"] == 0
+    print("[OK] /retry 解除退避等待节点：wa 立即回到 next_nodes 且计数清零")
+
     # --- 13. 列表 & 404 ---
     items = client.get("/api/releases").json()["items"]
-    assert {i["id"] for i in items} == {rid, rid2, rid3, cid, tid, rid_dur}
+    assert {i["id"] for i in items} == {
+        rid, rid2, rid3, cid, tid, rid_dur, rid_r, rid_e, rid_q, rid_m,
+    }
     assert client.get("/api/releases/nope").status_code == 404
     assert client.post("/api/releases/nope/report",
                        json={"node": "a", "status": "success", "version": "v"}).status_code == 404
@@ -306,11 +480,11 @@ from app import database  # noqa: E402
 database.init_db(os.environ["DB_PATH"])
 conn = database.get_conn()
 count = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
-assert count == 6, count
+assert count == 10, count
 with database.lock():
     v1 = conn.execute("SELECT status, version FROM releases WHERE version='v1'").fetchone()
 assert dict(v1) == {"status": "succeeded", "version": "v1"}
-print("[OK] SQLite 重新初始化幂等，历史数据保留（6 个批次）")
+print("[OK] SQLite 重新初始化幂等，历史数据保留（10 个批次）")
 
 # --- 15. 旧版 DB 文件（nodes 无 estimated_seconds 列）启动自动迁移，旧工期按 0 ---
 import sqlite3  # noqa: E402
@@ -343,7 +517,26 @@ config.DB_PATH = old_db
 database.init_db(old_db)
 cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(nodes)")}
 assert "estimated_seconds" in cols, cols
+# 重试列已迁移：旧节点 max_attempts=1（失败即回滚）、attempt_count=0、无等待标记
+for col in ("max_attempts", "retry_delay_seconds", "attempt_count",
+            "next_retry_at", "retry_scheduled"):
+    assert col in cols, col
 with TestClient(app) as legacy_client:
+    detail = legacy_client.get("/api/releases/leg1").json()
+    lx = detail["nodes"][0]
+    assert lx["max_attempts"] == 1 and lx["retry_delay_seconds"] == 0
+    assert lx["attempt_count"] == 0 and lx["retry_scheduled"] is False
+    assert lx["next_retry_at"] is None
+    # 旧批次失败：直接进入 failed + 回滚语义（无自动重试）
+    rr = legacy_client.post("/api/releases/leg1/report",
+                            json={"node": "x", "status": "failed", "version": "ver"})
+    assert rr.status_code == 200, rr.text
+    rb = rr.json()
+    assert rb["result"] == "failed_and_rolled_back"
+    assert rb["release"]["status"] == "failed"
+    assert rb["release"]["nodes"][0]["attempt_count"] == 1
+    print("[OK] 旧批次兼容 max_attempts=1：失败即回滚，无自动重试")
+
     lp = legacy_client.get("/api/releases/leg1/plan").json()
     assert lp["schedule"]["shortest_duration_seconds"] == 0
     assert lp["schedule"]["critical_nodes"] == ["x", "y"]
